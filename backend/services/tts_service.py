@@ -36,11 +36,33 @@ class TTSService:
             "Mira": settings.voice_mira
         }
 
+    def estimate_duration(self, text: str) -> float:
+        """
+        Estimate audio duration based on text length and speech speed.
+
+        Args:
+            text: Text to convert to speech
+
+        Returns:
+            Estimated duration in seconds
+        """
+        # Average speech rate: ~150 words per minute at normal speed
+        # Adjust for TTS speed setting
+        words = len(text.split())
+        base_wpm = 150  # words per minute at speed=1.0
+        adjusted_wpm = base_wpm * self.speed
+        duration = (words / adjusted_wpm) * 60  # convert to seconds
+
+        # Add small buffer for natural pauses
+        duration += 0.5
+
+        return duration
+
     async def generate_speech(
         self,
         text: str,
         speaker: str
-    ) -> str:
+    ) -> tuple[str, float]:
         """
         Generate speech audio from text.
 
@@ -49,12 +71,15 @@ class TTSService:
             speaker: Speaker name ('Alex' or 'Mira')
 
         Returns:
-            Relative URL to the generated audio file
+            Tuple of (relative URL to the generated audio file, estimated duration in seconds)
         """
         logger.info(f"Generating speech for {speaker}: {len(text)} characters")
 
         # Get voice for speaker
         voice = self.voices.get(speaker, settings.voice_alex)
+
+        # Estimate duration
+        duration = self.estimate_duration(text)
 
         # Generate unique filename
         timestamp = int(time.time() * 1000)
@@ -72,10 +97,10 @@ class TTSService:
             ) as response:
                 await response.stream_to_file(file_path)
 
-            logger.info(f"Generated audio: {filename}")
+            logger.info(f"Generated audio: {filename} (estimated duration: {duration:.1f}s)")
 
-            # Return URL path (relative to static directory)
-            return f"/static/audio/{filename}"
+            # Return URL path and duration
+            return f"/static/audio/{filename}", duration
 
         except Exception as e:
             logger.error(f"TTS generation failed for {speaker}: {e}", exc_info=True)

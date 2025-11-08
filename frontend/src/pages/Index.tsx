@@ -125,6 +125,7 @@ const Index = () => {
 
       if (Array.isArray(newTopics) && newTopics.length > 0) {
         setTopics(newTopics);
+        setVotedTopicId(null); // Clear previous vote when new topics arrive
         toast.success("New topic suggestions generated!");
       } else {
         console.warn("No topics received");

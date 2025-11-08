@@ -129,12 +129,11 @@ class PodcastScheduler:
                     alex_audio_task = tts_service.generate_speech(dialogue["alex"], "Alex")
                     mira_audio_task = tts_service.generate_speech(dialogue["mira"], "Mira")
 
-                    alex_audio_url, mira_audio_url = await asyncio.gather(
-                        alex_audio_task,
-                        mira_audio_task
-                    )
+                    results = await asyncio.gather(alex_audio_task, mira_audio_task)
+                    alex_audio_url, alex_duration = results[0]
+                    mira_audio_url, mira_duration = results[1]
 
-                    logger.info(f"Audio generated: Alex={alex_audio_url}, Mira={mira_audio_url}")
+                    logger.info(f"Audio generated: Alex={alex_audio_url} ({alex_duration:.1f}s), Mira={mira_audio_url} ({mira_duration:.1f}s)")
 
                     # Step 4: Create podcast turn
                     podcast_turn = PodcastTurn(
@@ -169,16 +168,18 @@ class PodcastScheduler:
                         turn_number=exchange_num
                     ))
 
-                    # Step 5: Broadcast events
+                    # Step 5: Broadcast events - Sequential playback with proper timing
 
                     # Play Alex first
+                    logger.info(f"Playing Alex ({alex_duration:.1f}s)...")
                     await state.broadcast_event("NOW_PLAYING", {
                         "speaker": "Alex",
                         "text": dialogue["alex"],
                         "audio_url": alex_audio_url,
                         "topic_id": selected_topic.id,
                         "topic": selected_topic.text,
-                        "turn_number": podcast_turn.turn_number
+                        "turn_number": podcast_turn.turn_number,
+                        "duration": alex_duration
                     })
 
                     await state.broadcast_event("TRANSCRIPT_UPDATE", {
@@ -187,16 +188,19 @@ class PodcastScheduler:
                         "turn_number": podcast_turn.turn_number
                     })
 
-                    # Wait a bit, then play Mira
-                    await asyncio.sleep(5)  # Approximate time for Alex's speech
+                    # Wait for Alex's audio to finish, plus small buffer
+                    await asyncio.sleep(alex_duration + 0.5)
 
+                    # Now play Mira
+                    logger.info(f"Playing Mira ({mira_duration:.1f}s)...")
                     await state.broadcast_event("NOW_PLAYING", {
                         "speaker": "Mira",
                         "text": dialogue["mira"],
                         "audio_url": mira_audio_url,
                         "topic_id": selected_topic.id,
                         "topic": selected_topic.text,
-                        "turn_number": podcast_turn.turn_number
+                        "turn_number": podcast_turn.turn_number,
+                        "duration": mira_duration
                     })
 
                     await state.broadcast_event("TRANSCRIPT_UPDATE", {
@@ -205,9 +209,13 @@ class PodcastScheduler:
                         "turn_number": podcast_turn.turn_number
                     })
 
-                    # Pause between exchanges
+                    # Wait for Mira's audio to finish before next exchange
+                    await asyncio.sleep(mira_duration + 0.5)
+
+                    # Small pause between exchanges for natural pacing
                     if exchange_num < exchanges_per_topic:
-                        await asyncio.sleep(3)  # Short pause between exchanges
+                        logger.info(f"Pausing before exchange {exchange_num + 1}...")
+                        await asyncio.sleep(2)  # Brief pause between exchanges
 
                 # All exchanges complete for this topic
                 # Mark topic as used (don't repeat)

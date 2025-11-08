@@ -7,6 +7,11 @@ interface RealAudioPlayerProps {
   speaker?: string;
 }
 
+interface AudioQueueItem {
+  url: string;
+  speaker: string;
+}
+
 export const RealAudioPlayer = ({
   onVolumeChange,
   audioUrl,
@@ -17,6 +22,12 @@ export const RealAudioPlayer = ({
   const audioRef = useRef<HTMLAudioElement>(null);
   const animationRef = useRef<number>();
   const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+  // Queue to prevent interruptions
+  const audioQueueRef = useRef<AudioQueueItem[]>([]);
+  const isProcessingQueueRef = useRef(false);
+  const currentAudioUrlRef = useRef<string | undefined>();
+  const currentSpeakerRef = useRef<string | undefined>();
 
   // Color gradient based on speaker
   const getBarColor = (index: number) => {
@@ -67,22 +78,59 @@ export const RealAudioPlayer = ({
     };
   }, [isPlaying, onVolumeChange]);
 
-  // Play audio when URL changes
-  useEffect(() => {
-    if (audioUrl && audioRef.current) {
+  // Process audio queue
+  const processQueue = async () => {
+    if (isProcessingQueueRef.current || audioQueueRef.current.length === 0) {
+      return;
+    }
+
+    isProcessingQueueRef.current = true;
+    const nextItem = audioQueueRef.current.shift();
+
+    if (nextItem && audioRef.current) {
       const audio = audioRef.current;
-      const fullUrl = audioUrl.startsWith('http') ? audioUrl : `${API_URL}${audioUrl}`;
+      const fullUrl = nextItem.url.startsWith('http') ? nextItem.url : `${API_URL}${nextItem.url}`;
+
+      currentAudioUrlRef.current = nextItem.url;
+      currentSpeakerRef.current = nextItem.speaker;
 
       audio.src = fullUrl;
-      audio.play().catch((error) => {
+      try {
+        await audio.play();
+      } catch (error) {
         console.error("Error playing audio:", error);
-      });
+        isProcessingQueueRef.current = false;
+        processQueue(); // Try next item
+      }
     }
-  }, [audioUrl, API_URL]);
+  };
+
+  // Add new audio to queue when URL changes
+  useEffect(() => {
+    if (audioUrl && speaker && audioUrl !== currentAudioUrlRef.current) {
+      // Add to queue
+      audioQueueRef.current.push({ url: audioUrl, speaker });
+      console.log(`Queued audio for ${speaker}, queue length: ${audioQueueRef.current.length}`);
+
+      // Start processing if not already
+      processQueue();
+    }
+  }, [audioUrl, speaker, API_URL]);
 
   const handlePlay = () => setIsPlaying(true);
   const handlePause = () => setIsPlaying(false);
-  const handleEnded = () => setIsPlaying(false);
+  const handleEnded = () => {
+    setIsPlaying(false);
+    isProcessingQueueRef.current = false;
+
+    // Play next in queue
+    if (audioQueueRef.current.length > 0) {
+      console.log(`Audio ended, processing next in queue (${audioQueueRef.current.length} remaining)`);
+      processQueue();
+    } else {
+      console.log("Audio ended, queue empty");
+    }
+  };
 
   return (
     <div className="flex flex-col items-center gap-2 w-full">
