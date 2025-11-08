@@ -1,0 +1,289 @@
+"""
+Podcast Scheduler - 20-second Turn Loop
+
+This is the core engine that runs the podcast. Every 20 seconds:
+1. Supervisor decides next topic
+2. Content Generator creates dialogue
+3. TTS generates audio
+4. Chat Agents react
+5. SSE broadcasts updates
+"""
+from backend.core.state import get_state
+from backend.services.supervisor import supervisor_service
+from backend.services.content_generator import content_generator_service
+from backend.services.tts_service import tts_service
+from backend.services.chat_agents import chat_agent_service
+from backend.models import PodcastTurn, DialogueSegment, TranscriptEntry, NowPlaying
+from backend.config import settings
+from backend.utils.logger import setup_logger
+import asyncio
+import time
+
+logger = setup_logger(__name__)
+
+
+class PodcastScheduler:
+    """
+    Main podcast scheduler that orchestrates the 20-second turn loop.
+    """
+
+    def __init__(self):
+        """Initialize scheduler."""
+        self.running = False
+        self.task: asyncio.Task = None
+        self.chat_agent_task: asyncio.Task = None
+
+    async def start(self):
+        """Start the podcast scheduler."""
+        if self.running:
+            logger.warning("Scheduler already running")
+            return
+
+        logger.info("Starting podcast scheduler")
+        self.running = True
+
+        state = await get_state()
+        state.start_podcast()
+
+        # Start main podcast loop
+        self.task = asyncio.create_task(self._podcast_loop())
+
+        # Start chat agent loop (if enabled)
+        if settings.enable_chat_agents:
+            self.chat_agent_task = asyncio.create_task(self._chat_agent_loop())
+
+        logger.info("Podcast scheduler started")
+
+    async def stop(self):
+        """Stop the podcast scheduler."""
+        if not self.running:
+            logger.warning("Scheduler not running")
+            return
+
+        logger.info("Stopping podcast scheduler")
+        self.running = False
+
+        state = await get_state()
+        state.stop_podcast()
+
+        # Cancel tasks
+        if self.task:
+            self.task.cancel()
+        if self.chat_agent_task:
+            self.chat_agent_task.cancel()
+
+        logger.info("Podcast scheduler stopped")
+
+    async def _podcast_loop(self):
+        """Main podcast loop - runs every 20 seconds."""
+        state = await get_state()
+
+        while self.running:
+            try:
+                logger.info(f"=== Starting turn {state.turn_number + 1} ===")
+
+                # Step 1: Supervisor decides next topic
+                current_topic = state.get_topic_by_id(state.current_topic_id) if state.current_topic_id else None
+                available_topics = state.get_sorted_topics()
+
+                if not available_topics:
+                    logger.warning("No topics available, waiting...")
+                    await asyncio.sleep(5)
+                    continue
+
+                turns_on_current = sum(
+                    1 for turn in state.turns_history
+                    if turn.topic_id == state.current_topic_id
+                ) if state.current_topic_id else 0
+
+                # Get decision from supervisor
+                decision = await supervisor_service.decide_next_topic(
+                    current_topic=current_topic,
+                    available_topics=available_topics,
+                    turns_on_current=turns_on_current
+                )
+
+                selected_topic = decision["selected_topic"]
+                state.current_topic_id = selected_topic.id
+
+                logger.info(f"Topic selected: {selected_topic.text} ({decision['decision']})")
+
+                # Step 2: Generate dialogue
+                last_alex = ""
+                last_mira = ""
+                if state.turns_history:
+                    last_turn = state.turns_history[-1]
+                    last_alex = last_turn.alex.text
+                    last_mira = last_turn.mira.text
+
+                dialogue = await content_generator_service.generate_dialogue(
+                    topic=selected_topic.text,
+                    context=decision.get("context_for_next_turn", ""),
+                    turn_number=state.turn_number + 1,
+                    last_alex_text=last_alex,
+                    last_mira_text=last_mira
+                )
+
+                logger.info(f"Dialogue generated: Alex ({len(dialogue['alex'])} chars), Mira ({len(dialogue['mira'])} chars)")
+
+                # Step 3: Generate audio for both speakers (parallel)
+                logger.info("Generating audio for both speakers...")
+
+                alex_audio_task = tts_service.generate_speech(dialogue["alex"], "Alex")
+                mira_audio_task = tts_service.generate_speech(dialogue["mira"], "Mira")
+
+                alex_audio_url, mira_audio_url = await asyncio.gather(
+                    alex_audio_task,
+                    mira_audio_task
+                )
+
+                logger.info(f"Audio generated: Alex={alex_audio_url}, Mira={mira_audio_url}")
+
+                # Step 4: Create podcast turn
+                podcast_turn = PodcastTurn(
+                    topic_id=selected_topic.id,
+                    topic_text=selected_topic.text,
+                    alex=DialogueSegment(
+                        speaker="Alex",
+                        text=dialogue["alex"],
+                        audio_url=alex_audio_url
+                    ),
+                    mira=DialogueSegment(
+                        speaker="Mira",
+                        text=dialogue["mira"],
+                        audio_url=mira_audio_url
+                    ),
+                    summary=dialogue["summary"],
+                    turn_number=state.turn_number + 1
+                )
+
+                # Add to state
+                state.add_turn(podcast_turn)
+
+                # Add transcript entries
+                state.add_transcript_entry(TranscriptEntry(
+                    speaker="Alex",
+                    text=dialogue["alex"],
+                    turn_number=podcast_turn.turn_number
+                ))
+                state.add_transcript_entry(TranscriptEntry(
+                    speaker="Mira",
+                    text=dialogue["mira"],
+                    turn_number=podcast_turn.turn_number
+                ))
+
+                logger.info(f"Turn {podcast_turn.turn_number} completed")
+
+                # Step 5: Broadcast events
+
+                # Play Alex first
+                await state.broadcast_event("NOW_PLAYING", {
+                    "speaker": "Alex",
+                    "text": dialogue["alex"],
+                    "audio_url": alex_audio_url,
+                    "topic_id": selected_topic.id,
+                    "topic": selected_topic.text,
+                    "turn_number": podcast_turn.turn_number
+                })
+
+                await state.broadcast_event("TRANSCRIPT_UPDATE", {
+                    "speaker": "Alex",
+                    "text": dialogue["alex"],
+                    "turn_number": podcast_turn.turn_number
+                })
+
+                # Wait a bit, then play Mira
+                await asyncio.sleep(5)  # Approximate time for Alex's speech
+
+                await state.broadcast_event("NOW_PLAYING", {
+                    "speaker": "Mira",
+                    "text": dialogue["mira"],
+                    "audio_url": mira_audio_url,
+                    "topic_id": selected_topic.id,
+                    "topic": selected_topic.text,
+                    "turn_number": podcast_turn.turn_number
+                })
+
+                await state.broadcast_event("TRANSCRIPT_UPDATE", {
+                    "speaker": "Mira",
+                    "text": dialogue["mira"],
+                    "turn_number": podcast_turn.turn_number
+                })
+
+                # Step 6: Clean up old audio files periodically
+                if state.turn_number % 10 == 0:
+                    await tts_service.cleanup_old_files()
+
+                # Wait for next turn
+                logger.info(f"Waiting {settings.podcast_turn_duration} seconds for next turn...")
+                await asyncio.sleep(settings.podcast_turn_duration)
+
+            except asyncio.CancelledError:
+                logger.info("Podcast loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in podcast loop: {e}", exc_info=True)
+                await asyncio.sleep(5)  # Wait before retry
+
+    async def _chat_agent_loop(self):
+        """Chat agent loop - generates AI comments periodically."""
+        state = await get_state()
+
+        # Stagger start times for variety
+        await asyncio.sleep(5)
+
+        while self.running:
+            try:
+                # Only generate if podcast is running
+                if not state.podcast_running or not state.turns_history:
+                    await asyncio.sleep(10)
+                    continue
+
+                # Get recent context
+                recent_turn = state.turns_history[-1] if state.turns_history else None
+                if not recent_turn:
+                    await asyncio.sleep(10)
+                    continue
+
+                current_topic = recent_turn.topic_text
+                recent_dialogue = f"Alex: {recent_turn.alex.text}\nMira: {recent_turn.mira.text}"
+
+                # Generate 1-2 comments
+                num_comments = 1 if state.turn_number % 2 == 0 else 2
+                comments = await chat_agent_service.generate_multiple_comments(
+                    current_topic=current_topic,
+                    recent_dialogue=recent_dialogue,
+                    count=num_comments
+                )
+
+                # Add to state and broadcast
+                for comment in comments:
+                    state.add_chat_message(comment)
+
+                    await state.broadcast_event("CHAT_MESSAGE", {
+                        "nickname": comment.nickname,
+                        "message": comment.message,
+                        "is_ai": comment.is_ai,
+                        "persona": comment.persona,
+                        "timestamp": comment.timestamp
+                    })
+
+                    logger.info(f"Chat agent comment: {comment.nickname}: {comment.message}")
+
+                    # Small delay between comments
+                    await asyncio.sleep(2)
+
+                # Wait before next batch
+                interval = settings.chat_agent_interval + (asyncio.get_event_loop().time() % 5)
+                await asyncio.sleep(interval)
+
+            except asyncio.CancelledError:
+                logger.info("Chat agent loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in chat agent loop: {e}", exc_info=True)
+                await asyncio.sleep(10)
+
+
+# Global scheduler instance
+podcast_scheduler = PodcastScheduler()
