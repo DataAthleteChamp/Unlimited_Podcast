@@ -28,10 +28,15 @@ class AppState:
         # Podcast state
         self.podcast_running: bool = False
         self.current_topic_id: Optional[str] = None
+        self.current_topic_text: str = ""  # Text of current topic being discussed
         self.turn_number: int = 0
         self.current_speaker: str = "Alex"  # Alternates between Alex and Mira
         self.last_turn_summary: str = ""
         self.podcast_started_at: Optional[float] = None
+
+        # Queue-based podcast system
+        self.topic_queue: List[str] = []  # Queue of topic IDs (FIFO)
+        self.used_topics: set = set()  # Topics already discussed (don't repeat)
 
         # Podcast history
         self.turns_history: List[PodcastTurn] = []
@@ -120,6 +125,87 @@ class AppState:
         """Get all topics sorted by score (highest first)."""
         return sorted(self.topics, key=lambda t: t.score, reverse=True)
 
+    # ===== Queue Management =====
+
+    def add_to_queue(self, topic_id: str) -> int:
+        """
+        Add topic to the podcast queue.
+
+        Args:
+            topic_id: Topic ID to add
+
+        Returns:
+            Position in queue (1-indexed)
+        """
+        # Don't add if already in queue or already used
+        if topic_id in self.topic_queue or topic_id in self.used_topics:
+            return -1
+
+        self.topic_queue.append(topic_id)
+        return len(self.topic_queue)
+
+    def get_next_from_queue(self) -> Optional[Topic]:
+        """
+        Get next topic from queue (FIFO).
+
+        Returns:
+            Next topic to discuss, or None if queue is empty
+        """
+        # Try to get from queue first
+        if self.topic_queue:
+            topic_id = self.topic_queue.pop(0)  # FIFO
+            topic = self.get_topic_by_id(topic_id)
+            if topic:
+                return topic
+
+        # Fallback: Get highest-voted unused topic
+        unused_topics = [
+            t for t in self.topics
+            if t.id not in self.used_topics
+        ]
+
+        if not unused_topics:
+            # All topics used, reset
+            self.used_topics.clear()
+            unused_topics = self.topics
+
+        if unused_topics:
+            return max(unused_topics, key=lambda t: t.score)
+
+        return None
+
+    def mark_topic_used(self, topic_id: str):
+        """Mark topic as discussed (won't be repeated)."""
+        self.used_topics.add(topic_id)
+
+    def get_queue_info(self) -> Dict:
+        """
+        Get information about the current queue.
+
+        Returns:
+            Dictionary with queue information
+        """
+        queue_topics = []
+        for topic_id in self.topic_queue:
+            topic = self.get_topic_by_id(topic_id)
+            if topic:
+                queue_topics.append({
+                    "id": topic.id,
+                    "text": topic.text,
+                    "votes": topic.votes
+                })
+
+        return {
+            "current_topic": self.current_topic_text,
+            "queue": queue_topics,
+            "queue_length": len(self.topic_queue),
+            "used_count": len(self.used_topics)
+        }
+
+    def clear_queue(self):
+        """Clear the entire queue."""
+        self.topic_queue.clear()
+
     # ===== Podcast Control =====
 
     def start_podcast(self):
@@ -177,6 +263,10 @@ class AppState:
     def get_recent_transcript(self, count: int = 10) -> List[TranscriptEntry]:
         """Get recent transcript entries."""
         return self.transcript[-count:]
+
+    def clear_transcript(self):
+        """Clear transcript (used when starting new topic)."""
+        self.transcript.clear()
 
     # ===== Chat Management =====
 
@@ -281,10 +371,13 @@ class AppState:
         self.topics.clear()
         self.podcast_running = False
         self.current_topic_id = None
+        self.current_topic_text = ""
         self.turn_number = 0
         self.current_speaker = "Alex"
         self.last_turn_summary = ""
         self.podcast_started_at = None
+        self.topic_queue.clear()
+        self.used_topics.clear()
         self.turns_history.clear()
         self.transcript.clear()
         self.chat_messages.clear()

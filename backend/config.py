@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     # Dust Configuration
     dust_api_key: str
     dust_workspace_id: str
+    dust_agent_supervisor_id: str
+    dust_agent_content_id: str
 
     # Server Configuration
     backend_host: str = "0.0.0.0"

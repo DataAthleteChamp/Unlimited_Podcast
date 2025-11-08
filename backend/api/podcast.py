@@ -1,7 +1,7 @@
 """
 Podcast control API endpoints.
 """
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from backend.models import PodcastStatus, TranscriptEntry, NowPlaying
 from backend.core.state import get_state
 from backend.core.scheduler import podcast_scheduler
@@ -88,14 +88,14 @@ async def get_now_playing():
         Current now playing info or None if nothing is playing
     """
     state = await get_state()
-    
+
     now_playing_data = state.get_current_now_playing()
     if not now_playing_data:
         return None
-    
+
     # Calculate approximate timing (you may want to track this more accurately)
     current_time = time.time()
-    
+
     return NowPlaying(
         topic_id=now_playing_data["topic_id"],
         topic_text=now_playing_data["topic_text"],
@@ -106,3 +106,52 @@ async def get_now_playing():
         ends_at=current_time + 10,    # Approximate - you may want to track this better
         turn_number=now_playing_data["turn_number"]
     )
+
+
+@router.get("/queue")
+async def get_queue():
+    """
+    Get current podcast queue information.
+
+    Returns:
+        Queue information including current topic and upcoming topics
+    """
+    state = await get_state()
+    return state.get_queue_info()
+
+
+@router.post("/queue/add/{topic_id}")
+async def add_to_queue(topic_id: str):
+    """
+    Add a topic to the podcast queue.
+
+    Args:
+        topic_id: Topic ID to add to queue
+
+    Returns:
+        Queue position and status
+    """
+    state = await get_state()
+
+    # Check if topic exists
+    topic = state.get_topic_by_id(topic_id)
+    if not topic:
+        raise HTTPException(status_code=404, detail="Topic not found")
+
+    # Add to queue
+    position = state.add_to_queue(topic_id)
+
+    if position == -1:
+        return {
+            "success": False,
+            "message": "Topic already in queue or already discussed"
+        }
+
+    # Broadcast queue update
+    await state.broadcast_event("QUEUE_UPDATED", state.get_queue_info())
+
+    return {
+        "success": True,
+        "position": position,
+        "message": f"Added to queue at position {position}"
+    }

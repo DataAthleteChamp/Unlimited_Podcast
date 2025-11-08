@@ -75,148 +75,151 @@ class PodcastScheduler:
         logger.info("Podcast scheduler stopped")
 
     async def _podcast_loop(self):
-        """Main podcast loop - runs every 20 seconds."""
+        """Main podcast loop - Queue-based endless podcast."""
         state = await get_state()
+        exchanges_per_topic = 3  # Number of Alex/Mira exchanges per topic
 
         while self.running:
             try:
-                logger.info(f"=== Starting turn {state.turn_number + 1} ===")
+                # Step 1: Get next topic from queue
+                selected_topic = state.get_next_from_queue()
 
-                # Step 1: Supervisor decides next topic
-                current_topic = state.get_topic_by_id(state.current_topic_id) if state.current_topic_id else None
-                available_topics = state.get_sorted_topics()
-
-                if not available_topics:
-                    logger.warning("No topics available, waiting...")
+                if not selected_topic:
+                    logger.warning("No topics in queue, waiting for votes...")
                     await asyncio.sleep(5)
                     continue
 
-                turns_on_current = sum(
-                    1 for turn in state.turns_history
-                    if turn.topic_id == state.current_topic_id
-                ) if state.current_topic_id else 0
-
-                # Get decision from supervisor
-                decision = await supervisor_service.decide_next_topic(
-                    current_topic=current_topic,
-                    available_topics=available_topics,
-                    turns_on_current=turns_on_current
-                )
-
-                selected_topic = decision["selected_topic"]
+                # Clear transcript for fresh start
+                logger.info(f"=== New Topic: {selected_topic.text} ===")
+                state.clear_transcript()
                 state.current_topic_id = selected_topic.id
+                state.current_topic_text = selected_topic.text
 
-                logger.info(f"Topic selected: {selected_topic.text} ({decision['decision']})")
+                # Broadcast topic change
+                await state.broadcast_event("TOPIC_CHANGED", {
+                    "topic_id": selected_topic.id,
+                    "topic_text": selected_topic.text
+                })
 
-                # Step 2: Generate dialogue
+                # Do multiple exchanges for this topic
                 last_alex = ""
                 last_mira = ""
-                if state.turns_history:
-                    last_turn = state.turns_history[-1]
-                    last_alex = last_turn.alex.text
-                    last_mira = last_turn.mira.text
 
-                dialogue = await content_generator_service.generate_dialogue(
-                    topic=selected_topic.text,
-                    context=decision.get("context_for_next_turn", ""),
-                    turn_number=state.turn_number + 1,
-                    last_alex_text=last_alex,
-                    last_mira_text=last_mira
-                )
+                for exchange_num in range(1, exchanges_per_topic + 1):
+                    logger.info(f"=== Exchange {exchange_num}/{exchanges_per_topic} for: {selected_topic.text} ===")
 
-                logger.info(f"Dialogue generated: Alex ({len(dialogue['alex'])} chars), Mira ({len(dialogue['mira'])} chars)")
+                    # Step 2: Generate dialogue (builds on previous exchanges)
+                    dialogue = await content_generator_service.generate_dialogue(
+                        topic=selected_topic.text,
+                        context=f"This is exchange {exchange_num} of {exchanges_per_topic} on this topic." if exchange_num > 1 else "",
+                        turn_number=exchange_num,
+                        last_alex_text=last_alex,
+                        last_mira_text=last_mira
+                    )
 
-                # Step 3: Generate audio for both speakers (parallel)
-                logger.info("Generating audio for both speakers...")
+                    # Update for next exchange
+                    last_alex = dialogue["alex"]
+                    last_mira = dialogue["mira"]
 
-                alex_audio_task = tts_service.generate_speech(dialogue["alex"], "Alex")
-                mira_audio_task = tts_service.generate_speech(dialogue["mira"], "Mira")
+                    logger.info(f"Dialogue generated: Alex ({len(dialogue['alex'])} chars), Mira ({len(dialogue['mira'])} chars)")
 
-                alex_audio_url, mira_audio_url = await asyncio.gather(
-                    alex_audio_task,
-                    mira_audio_task
-                )
+                    # Step 3: Generate audio for both speakers (parallel)
+                    logger.info("Generating audio for both speakers...")
 
-                logger.info(f"Audio generated: Alex={alex_audio_url}, Mira={mira_audio_url}")
+                    alex_audio_task = tts_service.generate_speech(dialogue["alex"], "Alex")
+                    mira_audio_task = tts_service.generate_speech(dialogue["mira"], "Mira")
 
-                # Step 4: Create podcast turn
-                podcast_turn = PodcastTurn(
-                    topic_id=selected_topic.id,
-                    topic_text=selected_topic.text,
-                    alex=DialogueSegment(
+                    alex_audio_url, mira_audio_url = await asyncio.gather(
+                        alex_audio_task,
+                        mira_audio_task
+                    )
+
+                    logger.info(f"Audio generated: Alex={alex_audio_url}, Mira={mira_audio_url}")
+
+                    # Step 4: Create podcast turn
+                    podcast_turn = PodcastTurn(
+                        topic_id=selected_topic.id,
+                        topic_text=selected_topic.text,
+                        alex=DialogueSegment(
+                            speaker="Alex",
+                            text=dialogue["alex"],
+                            audio_url=alex_audio_url
+                        ),
+                        mira=DialogueSegment(
+                            speaker="Mira",
+                            text=dialogue["mira"],
+                            audio_url=mira_audio_url
+                        ),
+                        summary=dialogue["summary"],
+                        turn_number=exchange_num
+                    )
+
+                    # Add to state
+                    state.add_turn(podcast_turn)
+
+                    # Add transcript entries
+                    state.add_transcript_entry(TranscriptEntry(
                         speaker="Alex",
                         text=dialogue["alex"],
-                        audio_url=alex_audio_url
-                    ),
-                    mira=DialogueSegment(
+                        turn_number=exchange_num
+                    ))
+                    state.add_transcript_entry(TranscriptEntry(
                         speaker="Mira",
                         text=dialogue["mira"],
-                        audio_url=mira_audio_url
-                    ),
-                    summary=dialogue["summary"],
-                    turn_number=state.turn_number + 1
-                )
+                        turn_number=exchange_num
+                    ))
 
-                # Add to state
-                state.add_turn(podcast_turn)
+                    # Step 5: Broadcast events
 
-                # Add transcript entries
-                state.add_transcript_entry(TranscriptEntry(
-                    speaker="Alex",
-                    text=dialogue["alex"],
-                    turn_number=podcast_turn.turn_number
-                ))
-                state.add_transcript_entry(TranscriptEntry(
-                    speaker="Mira",
-                    text=dialogue["mira"],
-                    turn_number=podcast_turn.turn_number
-                ))
+                    # Play Alex first
+                    await state.broadcast_event("NOW_PLAYING", {
+                        "speaker": "Alex",
+                        "text": dialogue["alex"],
+                        "audio_url": alex_audio_url,
+                        "topic_id": selected_topic.id,
+                        "topic": selected_topic.text,
+                        "turn_number": podcast_turn.turn_number
+                    })
 
-                logger.info(f"Turn {podcast_turn.turn_number} completed")
+                    await state.broadcast_event("TRANSCRIPT_UPDATE", {
+                        "speaker": "Alex",
+                        "text": dialogue["alex"],
+                        "turn_number": podcast_turn.turn_number
+                    })
 
-                # Step 5: Broadcast events
+                    # Wait a bit, then play Mira
+                    await asyncio.sleep(5)  # Approximate time for Alex's speech
 
-                # Play Alex first
-                await state.broadcast_event("NOW_PLAYING", {
-                    "speaker": "Alex",
-                    "text": dialogue["alex"],
-                    "audio_url": alex_audio_url,
-                    "topic_id": selected_topic.id,
-                    "topic": selected_topic.text,
-                    "turn_number": podcast_turn.turn_number
-                })
+                    await state.broadcast_event("NOW_PLAYING", {
+                        "speaker": "Mira",
+                        "text": dialogue["mira"],
+                        "audio_url": mira_audio_url,
+                        "topic_id": selected_topic.id,
+                        "topic": selected_topic.text,
+                        "turn_number": podcast_turn.turn_number
+                    })
 
-                await state.broadcast_event("TRANSCRIPT_UPDATE", {
-                    "speaker": "Alex",
-                    "text": dialogue["alex"],
-                    "turn_number": podcast_turn.turn_number
-                })
+                    await state.broadcast_event("TRANSCRIPT_UPDATE", {
+                        "speaker": "Mira",
+                        "text": dialogue["mira"],
+                        "turn_number": podcast_turn.turn_number
+                    })
 
-                # Wait a bit, then play Mira
-                await asyncio.sleep(5)  # Approximate time for Alex's speech
+                    # Pause between exchanges
+                    if exchange_num < exchanges_per_topic:
+                        await asyncio.sleep(3)  # Short pause between exchanges
 
-                await state.broadcast_event("NOW_PLAYING", {
-                    "speaker": "Mira",
-                    "text": dialogue["mira"],
-                    "audio_url": mira_audio_url,
-                    "topic_id": selected_topic.id,
-                    "topic": selected_topic.text,
-                    "turn_number": podcast_turn.turn_number
-                })
-
-                await state.broadcast_event("TRANSCRIPT_UPDATE", {
-                    "speaker": "Mira",
-                    "text": dialogue["mira"],
-                    "turn_number": podcast_turn.turn_number
-                })
+                # All exchanges complete for this topic
+                # Mark topic as used (don't repeat)
+                state.mark_topic_used(selected_topic.id)
+                logger.info(f"Completed all {exchanges_per_topic} exchanges for '{selected_topic.text}'")
 
                 # Step 6: Clean up old audio files periodically
-                if state.turn_number % 10 == 0:
-                    await tts_service.cleanup_old_files()
+                await tts_service.cleanup_old_files()
 
-                # Wait for next turn
-                logger.info(f"Waiting {settings.podcast_turn_duration} seconds for next turn...")
-                await asyncio.sleep(settings.podcast_turn_duration)
+                # Small pause before next topic
+                logger.info("Topic complete. Moving to next topic in queue...")
+                await asyncio.sleep(5)
 
             except asyncio.CancelledError:
                 logger.info("Podcast loop cancelled")

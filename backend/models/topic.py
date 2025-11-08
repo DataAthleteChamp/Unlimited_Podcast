@@ -79,3 +79,23 @@ class ReactionRequest(BaseModel):
                 "emoji": "👍"
             }
         }
+
+
+class ChatMessageForSuggestion(BaseModel):
+    """Chat message for topic suggestions."""
+    text: str
+    sender: str
+    timestamp: str
+
+
+class TopicSuggestionsRequest(BaseModel):
+    """Request model for generating topic suggestions from chat."""
+    messages: list[ChatMessageForSuggestion]
+
+
+class TopicSuggestion(BaseModel):
+    """AI-generated topic suggestion."""
+    id: int
+    title: str
+    description: str
+    votes: int = 0

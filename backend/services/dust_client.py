@@ -30,12 +30,11 @@ class DustClient:
         self.workspace_id = settings.dust_workspace_id
         self.enabled = settings.enable_dust
 
-        # Agent IDs (to be set after creating agents in Dust UI)
-        # You'll get these IDs when you create agents in Dust
+        # Agent IDs from configuration
         self.agent_ids = {
-            "supervisor": None,  # Set this after creating "podcast-supervisor" agent
-            "content": None,      # Set this after creating "podcast-dialogue-writer" agent
-            "chat": None          # Set this after creating "podcast-chat-agent" agent
+            "supervisor": settings.dust_agent_supervisor_id,
+            "content": settings.dust_agent_content_id,
+            "chat": None  # Optional: add DUST_AGENT_CHAT_ID to .env if needed
         }
 
         self.client = httpx.AsyncClient(timeout=60.0)
@@ -75,8 +74,16 @@ class DustClient:
                 message=message
             )
 
-            # Parse response
-            decision = json.loads(response)
+            # Parse response (may be wrapped in markdown)
+            response_text = response.strip()
+
+            # Extract JSON from markdown code blocks if present
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+
+            decision = json.loads(response_text)
             logger.info(f"Dust supervisor decision: {decision['decision']}")
             return decision
 
@@ -121,7 +128,25 @@ class DustClient:
                 message=message
             )
 
-            dialogue = json.loads(response)
+            # Debug: Log the raw response
+            logger.debug(f"Content generator raw response (first 200 chars): {response[:200]}")
+
+            # Parse response (may be wrapped in markdown)
+            response_text = response.strip()
+
+            # Extract JSON from markdown code blocks if present
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0].strip()
+
+            logger.debug(f"Parsed response text (first 200 chars): {response_text[:200]}")
+
+            if not response_text:
+                logger.error("Content generator returned empty response")
+                return None
+
+            dialogue = json.loads(response_text)
             logger.info("Dust content generator succeeded")
             return dialogue
 
@@ -181,7 +206,7 @@ Generate a community comment."""
             message: Message to send to agent
 
         Returns:
-            Agent response text
+            Agent response text (accumulated from streaming tokens)
         """
         url = f"{self.base_url}/w/{self.workspace_id}/assistant/conversations"
 
@@ -193,12 +218,16 @@ Generate a community comment."""
         payload = {
             "message": {
                 "content": message,
-                "mentions": [{"configurationId": agent_id}]
+                "mentions": [{"configurationId": agent_id}],
+                "context": {
+                    "timezone": "UTC",
+                    "username": "podcast_system",
+                    "email": None,
+                    "fullName": None,
+                    "profilePictureUrl": None
+                }
             },
-            "contentFragment": {
-                "title": "Podcast Turn",
-                "content": message
-            }
+            "blocking": True  # Use blocking mode for simpler response handling
         }
 
         response = await self.client.post(url, headers=headers, json=payload)
@@ -206,14 +235,36 @@ Generate a community comment."""
 
         data = response.json()
 
-        # Extract agent response from Dust API response
-        # (Adjust based on actual Dust API response structure)
-        if "message" in data:
-            return data["message"]["content"]
-        elif "content" in data:
-            return data["content"]
-        else:
-            raise ValueError(f"Unexpected Dust API response: {data}")
+        # Extract agent response from Dust API blocking response
+        # Structure: data.conversation.content is a list of lists
+        # content[0] = user message, content[1] = agent response
+        if "conversation" in data and "content" in data["conversation"]:
+            content = data["conversation"]["content"]
+            if isinstance(content, list) and len(content) > 1:
+                # Get the agent's response (second item in content list)
+                agent_messages = content[1]
+                if isinstance(agent_messages, list):
+                    # Find the agent_message in the list
+                    for msg in agent_messages:
+                        if isinstance(msg, dict) and msg.get("type") == "agent_message":
+                            if "content" in msg:
+                                return msg["content"]
+
+        # Fallback: try to find any agent_message in the structure
+        if "conversation" in data and "content" in data["conversation"]:
+            content = data["conversation"]["content"]
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, list):
+                        for msg in item:
+                            if isinstance(msg, dict) and msg.get("type") == "agent_message" and "content" in msg:
+                                return msg["content"]
+
+        # If we can't find the response in expected locations, log the structure
+        logger.error(f"Unexpected Dust API response structure. Keys: {data.keys()}")
+        if "conversation" in data:
+            logger.error(f"Conversation keys: {list(data['conversation'].keys())}")
+        raise ValueError(f"Could not extract agent response from Dust API response")
 
     def _format_supervisor_message(
         self,

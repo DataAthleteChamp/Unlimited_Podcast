@@ -5,6 +5,8 @@ This service uses GPT-4o to make strategic decisions about:
 - Which topic to discuss next
 - Whether to continue current topic or switch
 - Context management for the podcast
+
+Can use Dust.tt agents if enabled, with OpenAI as fallback.
 """
 from openai import AsyncOpenAI
 from backend.config import settings
@@ -52,6 +54,63 @@ class SupervisorService:
             }
         """
         logger.info(f"Supervisor deciding next topic. Current: {current_topic.text if current_topic else 'None'}")
+
+        # Try Dust agent first if enabled
+        if settings.enable_dust:
+            logger.info("Attempting Dust supervisor agent")
+            try:
+                from backend.services.dust_client import dust_client
+
+                current_topic_dict = None
+                if current_topic:
+                    current_topic_dict = {
+                        "text": current_topic.text,
+                        "turns": turns_on_current,
+                        "thumbs_up": current_topic.reactions_thumbs_up,
+                        "thumbs_down": current_topic.reactions_thumbs_down,
+                        "positive_ratio": current_topic.positive_ratio,
+                        "score": current_topic.score
+                    }
+
+                available_topics_dict = [
+                    {
+                        "text": topic.text,
+                        "votes": topic.votes,
+                        "thumbs_up": topic.reactions_thumbs_up,
+                        "thumbs_down": topic.reactions_thumbs_down,
+                        "score": topic.score,
+                        "positive_ratio": topic.positive_ratio
+                    }
+                    for topic in available_topics[:5]
+                ]
+
+                dust_decision = await dust_client.call_supervisor_agent(
+                    current_topic=current_topic_dict,
+                    available_topics=available_topics_dict,
+                    turns_on_current=turns_on_current
+                )
+
+                if dust_decision:
+                    # Attach the actual Topic object
+                    selected_text = dust_decision.get("selected_topic", "")
+                    if dust_decision["decision"] == "continue" and current_topic:
+                        dust_decision["selected_topic"] = current_topic
+                    else:
+                        selected_topic = next(
+                            (t for t in available_topics if t.text == selected_text),
+                            available_topics[0] if available_topics else None
+                        )
+                        dust_decision["selected_topic"] = selected_topic
+
+                    logger.info(f"Dust supervisor succeeded: {dust_decision['decision']}")
+                    return dust_decision
+                else:
+                    logger.info("Dust supervisor returned None, falling back to OpenAI")
+            except Exception as e:
+                logger.warning(f"Dust supervisor failed, falling back to OpenAI: {e}")
+
+        # Fallback to OpenAI (or primary path if Dust disabled)
+        logger.info("Using OpenAI supervisor")
 
         # Prepare topic data for the prompt
         topics_data = [
