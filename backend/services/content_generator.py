@@ -3,6 +3,8 @@ Content Generator LLM Service - The "Dialogue Writer"
 
 This service uses GPT-4o-mini to generate podcast dialogue for both speakers.
 One LLM writes the entire conversation like a screenplay.
+
+Can use Dust.tt agents if enabled, with OpenAI as fallback.
 """
 from openai import AsyncOpenAI
 from backend.config import settings
@@ -75,6 +77,31 @@ class ContentGeneratorService:
             }
         """
         logger.info(f"Generating dialogue for topic: {topic}, turn: {turn_number}")
+
+        # Try Dust agent first if enabled
+        if settings.enable_dust:
+            logger.info("Attempting Dust content generator agent")
+            try:
+                from backend.services.dust_client import dust_client
+
+                dust_dialogue = await dust_client.call_content_generator_agent(
+                    topic=topic,
+                    context=context,
+                    turn_number=turn_number,
+                    last_alex=last_alex_text,
+                    last_mira=last_mira_text
+                )
+
+                if dust_dialogue:
+                    logger.info("Dust content generator succeeded")
+                    return dust_dialogue
+                else:
+                    logger.info("Dust content generator returned None, falling back to OpenAI")
+            except Exception as e:
+                logger.warning(f"Dust content generator failed, falling back to OpenAI: {e}")
+
+        # Fallback to OpenAI (or primary path if Dust disabled)
+        logger.info("Using OpenAI content generator")
 
         prompt = self._build_dialogue_prompt(
             topic, context, turn_number, last_alex_text, last_mira_text
